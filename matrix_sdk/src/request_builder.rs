@@ -11,7 +11,7 @@ use matrix_sdk_common::{
         },
         uiaa::AuthData,
     },
-    events::{room::power_levels::PowerLevelsEventContent, EventJson},
+    events::room::{create::PreviousRoom, power_levels::PowerLevelsEventContent},
     identifiers::{DeviceId, RoomId, UserId},
     js_int::UInt,
 };
@@ -28,8 +28,8 @@ use matrix_sdk_common::{
 /// # let homeserver = Url::parse("http://example.com").unwrap();
 /// # let mut rt = tokio::runtime::Runtime::new().unwrap();
 /// # rt.block_on(async {
-/// let mut builder = RoomBuilder::default();
-/// builder.creation_content(false)
+/// let mut builder = RoomBuilder::new();
+/// builder.federate(false)
 ///     .initial_state(vec![])
 ///     .visibility(Visibility::Public)
 ///     .name("name")
@@ -38,34 +38,38 @@ use matrix_sdk_common::{
 /// client.create_room(builder).await;
 /// # })
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RoomBuilder {
-    creation_content: Option<CreationContent>,
-    initial_state: Vec<InitialStateEvent>,
-    invite: Vec<UserId>,
-    invite_3pid: Vec<Invite3pid>,
-    is_direct: Option<bool>,
-    name: Option<String>,
-    power_level_content_override: Option<PowerLevelsEventContent>,
-    preset: Option<RoomPreset>,
-    room_alias_name: Option<String>,
-    room_version: Option<String>,
-    topic: Option<String>,
-    visibility: Option<Visibility>,
+    req: create_room::Request,
+    creation_content: CreationContent,
 }
 
 impl RoomBuilder {
     /// Returns an empty `RoomBuilder` for creating rooms.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            req: create_room::Request::new(),
+            creation_content: CreationContent {
+                federate: true,
+                predecessor: None,
+            },
+        }
     }
 
-    /// Set the `CreationContent`.
+    /// A reference to the room this room replaces, if the previous room was upgraded.
     ///
-    /// Weather users on other servers can join this room.
-    pub fn creation_content(&mut self, federate: bool) -> &mut Self {
-        let federate = Some(federate);
-        self.creation_content = Some(CreationContent { federate });
+    /// Note: this is used to create the `CreationContent`.
+    pub fn previous_room(&mut self, previous_room: PreviousRoom) -> &mut Self {
+        self.creation_content.predecessor = Some(previous_room);
+        self
+    }
+
+    /// Whether users on other servers can join this room.
+    ///
+    /// Defaults to `true` if key does not exist.
+    /// Note: this is used to create the `CreationContent`.
+    pub fn federate(&mut self, federate: bool) -> &mut Self {
+        self.creation_content.federate = federate;
         self
     }
 
@@ -74,7 +78,7 @@ impl RoomBuilder {
     /// Takes precedence over events set by preset, but gets overriden by
     /// name and topic keys.
     pub fn initial_state(&mut self, state: Vec<InitialStateEvent>) -> &mut Self {
-        self.initial_state = state;
+        self.req.initial_state = state;
         self
     }
 
@@ -82,57 +86,57 @@ impl RoomBuilder {
     ///
     /// This will tell the server to invite everyone in the list to the newly created room.
     pub fn invite(&mut self, invite: Vec<UserId>) -> &mut Self {
-        self.invite = invite;
+        self.req.invite = invite;
         self
     }
 
     /// Sets a list of third party IDs of users to invite.
     pub fn invite_3pid(&mut self, invite: Vec<Invite3pid>) -> &mut Self {
-        self.invite_3pid = invite;
+        self.req.invite_3pid = invite;
         self
     }
 
     /// If set, this sets the `is_direct` flag on room invites.
     pub fn is_direct(&mut self, direct: bool) -> &mut Self {
-        self.is_direct = Some(direct);
+        self.req.is_direct = Some(direct);
         self
     }
 
     /// If this is included, an `m.room.name` event will be sent into the room to indicate
     /// the name of the room.
     pub fn name<S: Into<String>>(&mut self, name: S) -> &mut Self {
-        self.name = Some(name.into());
+        self.req.name = Some(name.into());
         self
     }
 
     /// Power level content to override in the default power level event.
     pub fn power_level_override(&mut self, power: PowerLevelsEventContent) -> &mut Self {
-        self.power_level_content_override = Some(power);
+        self.req.power_level_content_override = Some(power.into());
         self
     }
 
     /// Convenience parameter for setting various default state events based on a preset.
     pub fn preset(&mut self, preset: RoomPreset) -> &mut Self {
-        self.preset = Some(preset);
+        self.req.preset = Some(preset);
         self
     }
 
     /// The desired room alias local part.
     pub fn room_alias_name<S: Into<String>>(&mut self, alias: S) -> &mut Self {
-        self.room_alias_name = Some(alias.into());
+        self.req.room_alias_name = Some(alias.into());
         self
     }
 
     /// Room version to set for the room. Defaults to homeserver's default if not specified.
     pub fn room_version<S: Into<String>>(&mut self, version: S) -> &mut Self {
-        self.room_version = Some(version.into());
+        self.req.room_version = Some(version.into());
         self
     }
 
     /// If this is included, an `m.room.topic` event will be sent into the room to indicate
     /// the topic for the room.
     pub fn topic<S: Into<String>>(&mut self, topic: S) -> &mut Self {
-        self.topic = Some(topic.into());
+        self.req.topic = Some(topic.into());
         self
     }
 
@@ -140,27 +144,21 @@ impl RoomBuilder {
     /// room list. A private visibility will hide the room from the published room list.
     /// Rooms default to private visibility if this key is not included.
     pub fn visibility(&mut self, vis: Visibility) -> &mut Self {
-        self.visibility = Some(vis);
+        self.req.visibility = Some(vis);
         self
     }
 }
 
+impl Default for RoomBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Into<create_room::Request> for RoomBuilder {
-    fn into(self) -> create_room::Request {
-        create_room::Request {
-            creation_content: self.creation_content,
-            initial_state: self.initial_state,
-            invite: self.invite,
-            invite_3pid: self.invite_3pid,
-            is_direct: self.is_direct,
-            name: self.name,
-            power_level_content_override: self.power_level_content_override.map(EventJson::from),
-            preset: self.preset,
-            room_alias_name: self.room_alias_name,
-            room_version: self.room_version,
-            topic: self.topic,
-            visibility: self.visibility,
-        }
+    fn into(mut self) -> create_room::Request {
+        self.req.creation_content = Some(self.creation_content);
+        self.req
     }
 }
 
@@ -193,14 +191,7 @@ impl Into<create_room::Request> for RoomBuilder {
 /// # })
 /// ```
 #[derive(Clone, Debug)]
-pub struct MessagesRequestBuilder {
-    room_id: RoomId,
-    from: String,
-    to: Option<String>,
-    direction: Option<Direction>,
-    limit: Option<u32>,
-    filter: Option<RoomEventFilter>,
-}
+pub struct MessagesRequestBuilder(get_message_events::Request);
 
 impl MessagesRequestBuilder {
     /// Create a `MessagesRequestBuilder` builder to make a `get_message_events::Request`.
@@ -213,21 +204,18 @@ impl MessagesRequestBuilder {
     /// a `prev_batch` token from a sync response, or a start or end token from a previous request
     /// to this endpoint.
     pub fn new(room_id: RoomId, from: String) -> Self {
-        Self {
+        Self(get_message_events::Request::new(
             room_id,
             from,
-            to: None,
-            direction: None,
-            limit: None,
-            filter: None,
-        }
+            Direction::Backward,
+        ))
     }
 
     /// A `next_batch` token or `start` or `end` from a previous `get_message_events` request.
     ///
     /// This token signals when to stop receiving events.
     pub fn to<S: Into<String>>(&mut self, to: S) -> &mut Self {
-        self.to = Some(to.into());
+        self.0.to = Some(to.into());
         self
     }
 
@@ -235,7 +223,7 @@ impl MessagesRequestBuilder {
     ///
     /// If not specified `Direction::Backward` is used.
     pub fn direction(&mut self, direction: Direction) -> &mut Self {
-        self.direction = Some(direction);
+        self.0.dir = direction;
         self
     }
 
@@ -243,27 +231,20 @@ impl MessagesRequestBuilder {
     ///
     /// The default is 10.
     pub fn limit(&mut self, limit: u32) -> &mut Self {
-        self.limit = Some(limit);
+        self.0.limit = UInt::from(limit);
         self
     }
 
     /// Filter events by the given `RoomEventFilter`.
     pub fn filter(&mut self, filter: RoomEventFilter) -> &mut Self {
-        self.filter = Some(filter);
+        self.0.filter = Some(filter);
         self
     }
 }
 
 impl Into<get_message_events::Request> for MessagesRequestBuilder {
     fn into(self) -> get_message_events::Request {
-        get_message_events::Request {
-            room_id: self.room_id,
-            from: self.from,
-            to: self.to,
-            dir: self.direction.unwrap_or(Direction::Backward),
-            limit: self.limit.map(UInt::from),
-            filter: self.filter,
-        }
+        self.0
     }
 }
 
@@ -291,7 +272,7 @@ impl Into<get_message_events::Request> for MessagesRequestBuilder {
 pub struct RegistrationBuilder {
     password: Option<String>,
     username: Option<String>,
-    device_id: Option<DeviceId>,
+    device_id: Option<Box<DeviceId>>,
     initial_device_display_name: Option<String>,
     auth: Option<AuthData>,
     kind: Option<RegistrationKind>,
@@ -325,7 +306,7 @@ impl RegistrationBuilder {
     ///
     /// If this does not correspond to a known client device, a new device will be created.
     /// The server will auto-generate a device_id if this is not specified.
-    pub fn device_id<S: Into<String>>(&mut self, device_id: S) -> &mut Self {
+    pub fn device_id<S: Into<Box<DeviceId>>>(&mut self, device_id: S) -> &mut Self {
         self.device_id = Some(device_id.into());
         self
     }
@@ -473,10 +454,13 @@ mod test {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::api::r0::filter::{LazyLoadOptions, RoomEventFilter};
-    use crate::events::room::power_levels::NotificationPowerLevels;
-    use crate::js_int::Int;
-    use crate::{identifiers::RoomId, Client, Session};
+    use crate::{
+        api::r0::filter::{LazyLoadOptions, RoomEventFilter},
+        events::room::power_levels::NotificationPowerLevels,
+        identifiers::RoomId,
+        js_int::Int,
+        Client, Session,
+    };
 
     use matrix_sdk_test::test_json;
     use mockito::{mock, Matcher};
@@ -495,12 +479,12 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let mut builder = RoomBuilder::new();
         builder
-            .creation_content(false)
+            .federate(false)
             .initial_state(vec![])
             .visibility(Visibility::Public)
             .name("room_name")
@@ -543,7 +527,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let mut builder = MessagesRequestBuilder::new(

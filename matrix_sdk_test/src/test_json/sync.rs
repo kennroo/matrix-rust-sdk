@@ -20,13 +20,6 @@ lazy_static! {
                         "events": [
                             {
                                 "content": {
-                                    "event_id": "$someplace:example.org"
-                                },
-                                "room_id": "!roomid:room.com",
-                                "type": "m.fully_read"
-                            },
-                            {
-                                "content": {
                                     "ignored_users": {
                                         "@someone:example.org": {}
                                     }
@@ -47,7 +40,15 @@ lazy_static! {
                                         }
                                     }
                                 },
+                                "room_id": "!SVkFJHzfwvuaIEawgC:localhost",
                                 "type": "m.receipt"
+                            },
+                            {
+                                "content": {
+                                    "event_id": "$someplace:example.org"
+                                },
+                                "room_id": "!roomid:room.com",
+                                "type": "m.fully_read"
                             }
                         ]
                     },
@@ -307,13 +308,6 @@ lazy_static! {
                         "events": [
                             {
                                 "content": {
-                                    "event_id": "$someplace:example.org"
-                                },
-                                "room_id": "!roomid:room.com",
-                                "type": "m.fully_read"
-                            },
-                            {
-                                "content": {
                                     "ignored_users": {
                                         "@someone:example.org": {}
                                     }
@@ -335,6 +329,13 @@ lazy_static! {
                                     }
                                 },
                                 "type": "m.receipt"
+                            },
+                            {
+                                "content": {
+                                    "event_id": "$someplace:example.org"
+                                },
+                                "room_id": "!roomid:room.com",
+                                "type": "m.fully_read"
                             }
                         ]
                     },
@@ -570,6 +571,7 @@ lazy_static! {
                                         }
                                     }
                                 },
+                                "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
                                 "type": "m.receipt"
                             },
                             {
@@ -612,12 +614,12 @@ lazy_static! {
                                         "msgtype": "m.text"
                                     },
                                     "m.relates_to": {
-                                        "event_id": "some event id",
+                                        "event_id": "$someeventid:localhost",
                                         "rel_type": "m.replace"
                                     },
                                     "msgtype": "m.text"
                                 },
-                                "event_id": "edit event id",
+                                "event_id": "$editevid:localhost",
                                 "origin_server_ts": 159026265,
                                 "sender": "@alice:matrix.org",
                                 "type": "m.room.message",
@@ -773,13 +775,6 @@ lazy_static! {
                         "events": [
                             {
                                 "content": {
-                                    "event_id": "$someplace:example.org"
-                                },
-                                "room_id": "!roomid:room.com",
-                                "type": "m.fully_read"
-                            },
-                            {
-                                "content": {
                                     "ignored_users": {
                                         "@someone:example.org": {}
                                     }
@@ -801,6 +796,13 @@ lazy_static! {
                                     }
                                 },
                                 "type": "m.receipt"
+                            },
+                            {
+                                "content": {
+                                    "event_id": "$someplace:example.org"
+                                },
+                                "room_id": "!roomid:room.com",
+                                "type": "m.fully_read"
                             }
                         ]
                     },

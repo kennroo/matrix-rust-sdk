@@ -12,28 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::convert::TryFrom;
-use std::mem;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    convert::TryFrom,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use atomic::Atomic;
+use matrix_sdk_common::{
+    api::r0::keys::{AlgorithmAndDeviceId, DeviceKeys, KeyAlgorithm, SignedKey},
+    events::Algorithm,
+    identifiers::{DeviceId, UserId},
+};
+use serde_json::{json, Value};
 
 #[cfg(test)]
-use super::OlmMachine;
-use matrix_sdk_common::api::r0::keys::{DeviceKeys, KeyAlgorithm};
-use matrix_sdk_common::events::Algorithm;
-use matrix_sdk_common::identifiers::{DeviceId, UserId};
+use super::{Account, OlmMachine};
+
+use crate::{error::SignatureError, verify_json};
 
 /// A device represents a E2EE capable client of an user.
 #[derive(Debug, Clone)]
 pub struct Device {
     user_id: Arc<UserId>,
-    device_id: Arc<DeviceId>,
+    device_id: Arc<Box<DeviceId>>,
     algorithms: Arc<Vec<Algorithm>>,
-    keys: Arc<BTreeMap<KeyAlgorithm, String>>,
+    keys: Arc<BTreeMap<AlgorithmAndDeviceId, String>>,
+    signatures: Arc<BTreeMap<UserId, BTreeMap<AlgorithmAndDeviceId, String>>>,
     display_name: Arc<Option<String>>,
     deleted: Arc<AtomicBool>,
     trust_state: Arc<Atomic<TrustState>>,
@@ -68,17 +76,19 @@ impl Device {
     /// Create a new Device.
     pub fn new(
         user_id: UserId,
-        device_id: DeviceId,
+        device_id: Box<DeviceId>,
         display_name: Option<String>,
         trust_state: TrustState,
         algorithms: Vec<Algorithm>,
-        keys: BTreeMap<KeyAlgorithm, String>,
+        keys: BTreeMap<AlgorithmAndDeviceId, String>,
+        signatures: BTreeMap<UserId, BTreeMap<AlgorithmAndDeviceId, String>>,
     ) -> Self {
         Device {
             user_id: Arc::new(user_id),
             device_id: Arc::new(device_id),
             display_name: Arc::new(display_name),
             trust_state: Arc::new(Atomic::new(trust_state)),
+            signatures: Arc::new(signatures),
             algorithms: Arc::new(algorithms),
             keys: Arc::new(keys),
             deleted: Arc::new(AtomicBool::new(false)),
@@ -102,17 +112,33 @@ impl Device {
 
     /// Get the key of the given key algorithm belonging to this device.
     pub fn get_key(&self, algorithm: KeyAlgorithm) -> Option<&String> {
-        self.keys.get(&algorithm)
+        self.keys.get(&AlgorithmAndDeviceId(
+            algorithm,
+            self.device_id.as_ref().clone(),
+        ))
     }
 
     /// Get a map containing all the device keys.
-    pub fn keys(&self) -> &BTreeMap<KeyAlgorithm, String> {
+    pub fn keys(&self) -> &BTreeMap<AlgorithmAndDeviceId, String> {
         &self.keys
+    }
+
+    /// Get a map containing all the device signatures.
+    pub fn signatures(&self) -> &BTreeMap<UserId, BTreeMap<AlgorithmAndDeviceId, String>> {
+        &self.signatures
     }
 
     /// Get the trust state of the device.
     pub fn trust_state(&self) -> TrustState {
         self.trust_state.load(Ordering::Relaxed)
+    }
+
+    /// Set the trust state of the device to the given state.
+    ///
+    /// Note: This should only done in the cryptostore where the trust state can
+    /// be stored.
+    pub(crate) fn set_trust_state(&self, state: TrustState) {
+        self.trust_state.store(state, Ordering::Relaxed)
     }
 
     /// Get the list of algorithms this device supports.
@@ -126,13 +152,8 @@ impl Device {
     }
 
     /// Update a device with a new device keys struct.
-    pub(crate) fn update_device(&mut self, device_keys: &DeviceKeys) {
-        let mut keys = BTreeMap::new();
-
-        for (key_id, key) in device_keys.keys.iter() {
-            let key_id = key_id.0;
-            let _ = keys.insert(key_id, key.clone());
-        }
+    pub(crate) fn update_device(&mut self, device_keys: &DeviceKeys) -> Result<(), SignatureError> {
+        self.verify_device_keys(device_keys)?;
 
         let display_name = Arc::new(
             device_keys
@@ -142,63 +163,63 @@ impl Device {
                 .flatten(),
         );
 
-        let _ = mem::replace(
-            &mut self.algorithms,
-            Arc::new(device_keys.algorithms.clone()),
-        );
-        let _ = mem::replace(&mut self.keys, Arc::new(keys));
-        let _ = mem::replace(&mut self.display_name, display_name);
+        self.algorithms = Arc::new(device_keys.algorithms.clone());
+        self.keys = Arc::new(device_keys.keys.clone());
+        self.signatures = Arc::new(device_keys.signatures.clone());
+        self.display_name = display_name;
+
+        Ok(())
+    }
+
+    fn is_signed_by_device(&self, json: &mut Value) -> Result<(), SignatureError> {
+        let signing_key = self
+            .get_key(KeyAlgorithm::Ed25519)
+            .ok_or(SignatureError::MissingSigningKey)?;
+
+        verify_json(&self.user_id, &self.device_id.as_str(), signing_key, json)
+    }
+
+    pub(crate) fn verify_device_keys(
+        &self,
+        device_keys: &DeviceKeys,
+    ) -> Result<(), SignatureError> {
+        self.is_signed_by_device(&mut json!(&device_keys))
+    }
+
+    pub(crate) fn verify_one_time_key(
+        &self,
+        one_time_key: &SignedKey,
+    ) -> Result<(), SignatureError> {
+        self.is_signed_by_device(&mut json!(&one_time_key))
     }
 
     /// Mark the device as deleted.
     pub(crate) fn mark_as_deleted(&self) {
         self.deleted.store(true, Ordering::Relaxed);
     }
-}
 
-#[cfg(test)]
-impl From<&OlmMachine> for Device {
-    fn from(machine: &OlmMachine) -> Self {
-        Device {
-            user_id: Arc::new(machine.user_id().clone()),
-            device_id: Arc::new(machine.device_id().clone()),
-            algorithms: Arc::new(vec![
-                Algorithm::MegolmV1AesSha2,
-                Algorithm::OlmV1Curve25519AesSha2,
-            ]),
-            keys: Arc::new(
-                machine
-                    .identity_keys()
-                    .iter()
-                    .map(|(key, value)| {
-                        (
-                            KeyAlgorithm::try_from(key.as_ref()).unwrap(),
-                            value.to_owned(),
-                        )
-                    })
-                    .collect(),
-            ),
-            display_name: Arc::new(None),
-            deleted: Arc::new(AtomicBool::new(false)),
-            trust_state: Arc::new(Atomic::new(TrustState::Unset)),
-        }
+    #[cfg(test)]
+    pub async fn from_machine(machine: &OlmMachine) -> Device {
+        Device::from_account(&machine.account).await
+    }
+
+    #[cfg(test)]
+    pub async fn from_account(account: &Account) -> Device {
+        let device_keys = account.device_keys().await;
+        Device::try_from(&device_keys).unwrap()
     }
 }
 
-impl From<&DeviceKeys> for Device {
-    fn from(device_keys: &DeviceKeys) -> Self {
-        let mut keys = BTreeMap::new();
+impl TryFrom<&DeviceKeys> for Device {
+    type Error = SignatureError;
 
-        for (key_id, key) in device_keys.keys.iter() {
-            let key_id = key_id.0;
-            let _ = keys.insert(key_id, key.clone());
-        }
-
-        Device {
+    fn try_from(device_keys: &DeviceKeys) -> Result<Self, Self::Error> {
+        let device = Device {
             user_id: Arc::new(device_keys.user_id.clone()),
             device_id: Arc::new(device_keys.device_id.clone()),
             algorithms: Arc::new(device_keys.algorithms.clone()),
-            keys: Arc::new(keys),
+            signatures: Arc::new(device_keys.signatures.clone()),
+            keys: Arc::new(device_keys.keys.clone()),
             display_name: Arc::new(
                 device_keys
                     .unsigned
@@ -208,7 +229,10 @@ impl From<&DeviceKeys> for Device {
             ),
             deleted: Arc::new(AtomicBool::new(false)),
             trust_state: Arc::new(Atomic::new(TrustState::Unset)),
-        }
+        };
+
+        device.verify_device_keys(device_keys)?;
+        Ok(device)
     }
 }
 
@@ -221,30 +245,29 @@ impl PartialEq for Device {
 #[cfg(test)]
 pub(crate) mod test {
     use serde_json::json;
-    use std::convert::{From, TryFrom};
+    use std::convert::TryFrom;
 
     use crate::device::{Device, TrustState};
-    use matrix_sdk_common::api::r0::keys::{DeviceKeys, KeyAlgorithm};
-    use matrix_sdk_common::identifiers::UserId;
+    use matrix_sdk_common::{
+        api::r0::keys::{DeviceKeys, KeyAlgorithm},
+        identifiers::UserId,
+    };
 
     fn device_keys() -> DeviceKeys {
-        let user_id = UserId::try_from("@alice:example.org").unwrap();
-        let device_id = "DEVICEID";
-
         let device_keys = json!({
           "algorithms": vec![
               "m.olm.v1.curve25519-aes-sha2",
               "m.megolm.v1.aes-sha2"
           ],
-          "device_id": device_id,
-          "user_id": user_id.to_string(),
+          "device_id": "BNYQQWUMXO",
+          "user_id": "@example:localhost",
           "keys": {
-              "curve25519:DEVICEID": "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4",
-              "ed25519:DEVICEID": "nE6W2fCblxDcOFmeEtCHNl8/l8bXcu7GKyAswA4r3mM"
+              "curve25519:BNYQQWUMXO": "xfgbLIC5WAl1OIkpOzoxpCe8FsRDT6nch7NQsOb15nc",
+              "ed25519:BNYQQWUMXO": "2/5LWJMow5zhJqakV88SIc7q/1pa8fmkfgAzx72w9G4"
           },
           "signatures": {
-              user_id.to_string(): {
-                  "ed25519:DEVICEID": "m53Wkbh2HXkc3vFApZvCrfXcX3AI51GsDHustMhKwlv3TuOJMj4wistcOTM8q2+e/Ro7rWFUb9ZfnNbwptSUBA"
+              "@example:localhost": {
+                  "ed25519:BNYQQWUMXO": "kTwMrbsLJJM/uFGOj/oqlCaRuw7i9p/6eGrTlXjo8UJMCFAetoyWzoMcF35vSe4S6FTx8RJmqX6rM7ep53MHDQ"
               }
           },
           "unsigned": {
@@ -257,13 +280,13 @@ pub(crate) mod test {
 
     pub(crate) fn get_device() -> Device {
         let device_keys = device_keys();
-        Device::from(&device_keys)
+        Device::try_from(&device_keys).unwrap()
     }
 
     #[test]
     fn create_a_device() {
-        let user_id = UserId::try_from("@alice:example.org").unwrap();
-        let device_id = "DEVICEID";
+        let user_id = UserId::try_from("@example:localhost").unwrap();
+        let device_id = "BNYQQWUMXO";
 
         let device = get_device();
 
@@ -277,11 +300,11 @@ pub(crate) mod test {
         );
         assert_eq!(
             device.get_key(KeyAlgorithm::Curve25519).unwrap(),
-            "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4"
+            "xfgbLIC5WAl1OIkpOzoxpCe8FsRDT6nch7NQsOb15nc"
         );
         assert_eq!(
             device.get_key(KeyAlgorithm::Ed25519).unwrap(),
-            "nE6W2fCblxDcOFmeEtCHNl8/l8bXcu7GKyAswA4r3mM"
+            "2/5LWJMow5zhJqakV88SIc7q/1pa8fmkfgAzx72w9G4"
         );
     }
 
@@ -297,7 +320,7 @@ pub(crate) mod test {
         let mut device_keys = device_keys();
         device_keys.unsigned.as_mut().unwrap().device_display_name =
             Some("Alice's work computer".to_owned());
-        device.update_device(&device_keys);
+        device.update_device(&device_keys).unwrap();
 
         assert_eq!(
             "Alice's work computer",

@@ -3,104 +3,112 @@
 //! The `Room` struct optionally holds a `MessageQueue` if the "messages"
 //! feature is enabled.
 
-use std::cmp::Ordering;
-use std::ops::Deref;
-use std::vec::IntoIter;
+use std::{time::SystemTime, vec::IntoIter};
 
-use crate::events::room::message::MessageEvent;
-use crate::events::EventJson;
-
+use matrix_sdk_common::{
+    events::AnyPossiblyRedactedSyncMessageEvent,
+    identifiers::{EventId, UserId},
+};
 use serde::{de, ser, Serialize};
 
-/// A queue that holds the 10 most recent messages received from the server.
+/// Exposes some of the field access methods found in the event held by
+/// `AnyPossiblyRedacted*` enums.
+///
+/// This is just an extension trait to ease the use of certain event enums.
+pub trait PossiblyRedactedExt {
+    /// Access the redacted or full event's `event_id` field.
+    fn event_id(&self) -> &EventId;
+    /// Access the redacted or full event's `origin_server_ts` field.
+    fn origin_server_ts(&self) -> &SystemTime;
+    /// Access the redacted or full event's `sender` field.
+    fn sender(&self) -> &UserId;
+}
+
+impl PossiblyRedactedExt for AnyPossiblyRedactedSyncMessageEvent {
+    /// Access the underlying event's `event_id`.
+    fn event_id(&self) -> &EventId {
+        match self {
+            Self::Regular(e) => e.event_id(),
+            Self::Redacted(e) => e.event_id(),
+        }
+    }
+
+    /// Access the underlying event's `origin_server_ts`.
+    fn origin_server_ts(&self) -> &SystemTime {
+        match self {
+            Self::Regular(e) => e.origin_server_ts(),
+            Self::Redacted(e) => e.origin_server_ts(),
+        }
+    }
+
+    /// Access the underlying event's `sender`.
+    fn sender(&self) -> &UserId {
+        match self {
+            Self::Regular(e) => e.sender(),
+            Self::Redacted(e) => e.sender(),
+        }
+    }
+}
+
+const MESSAGE_QUEUE_CAP: usize = 35;
+
+/// A queue that holds the 35 most recent messages received from the server.
 #[derive(Clone, Debug, Default)]
 pub struct MessageQueue {
-    msgs: Vec<MessageWrapper>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct MessageWrapper(MessageEvent);
-
-impl Deref for MessageWrapper {
-    type Target = MessageEvent;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl PartialEq for MessageWrapper {
-    fn eq(&self, other: &MessageWrapper) -> bool {
-        self.0.event_id == other.0.event_id
-    }
-}
-
-impl Eq for MessageWrapper {}
-
-impl PartialOrd for MessageWrapper {
-    fn partial_cmp(&self, other: &MessageWrapper) -> Option<Ordering> {
-        Some(self.0.origin_server_ts.cmp(&other.0.origin_server_ts))
-    }
-}
-
-impl Ord for MessageWrapper {
-    fn cmp(&self, other: &MessageWrapper) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
-    }
-}
-
-impl PartialEq for MessageQueue {
-    fn eq(&self, other: &MessageQueue) -> bool {
-        self.msgs.len() == other.msgs.len()
-            && self
-                .msgs
-                .iter()
-                .zip(other.msgs.iter())
-                .all(|(msg_a, msg_b)| msg_a.event_id == msg_b.event_id)
-    }
+    pub(crate) msgs: Vec<AnyPossiblyRedactedSyncMessageEvent>,
 }
 
 impl MessageQueue {
     /// Create a new empty `MessageQueue`.
     pub fn new() -> Self {
         Self {
-            msgs: Vec::with_capacity(20),
+            msgs: Vec::with_capacity(45),
         }
     }
 
     /// Inserts a `MessageEvent` into `MessageQueue`, sorted by by `origin_server_ts`.
     ///
     /// Removes the oldest element in the queue if there are more than 10 elements.
-    pub fn push(&mut self, msg: MessageEvent) -> bool {
+    pub fn push(&mut self, msg: AnyPossiblyRedactedSyncMessageEvent) -> bool {
         // only push new messages into the queue
         if let Some(latest) = self.msgs.last() {
-            if msg.origin_server_ts < latest.origin_server_ts && self.msgs.len() >= 10 {
+            if msg.origin_server_ts() < latest.origin_server_ts() && self.msgs.len() >= 10 {
                 return false;
             }
         }
 
-        let message = MessageWrapper(msg);
-        match self.msgs.binary_search_by(|m| m.cmp(&message)) {
-            Ok(pos) => {
-                if self.msgs[pos] != message {
-                    self.msgs.insert(pos, message)
-                }
-            }
-            Err(pos) => self.msgs.insert(pos, message),
+        if self.msgs.iter().all(|old| old.event_id() != msg.event_id()) {
+            self.msgs.push(msg)
         }
-        if self.msgs.len() > 10 {
-            self.msgs.remove(0);
+
+        if self.msgs.len() > MESSAGE_QUEUE_CAP {
+            self.msgs.pop();
         }
         true
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &MessageWrapper> {
+    /// Iterate over the messages in the queue.
+    pub fn iter(&self) -> impl Iterator<Item = &AnyPossiblyRedactedSyncMessageEvent> {
         self.msgs.iter()
+    }
+
+    /// Iterate over each message mutably.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut AnyPossiblyRedactedSyncMessageEvent> {
+        self.msgs.iter_mut()
+    }
+}
+
+impl PartialEq for MessageQueue {
+    fn eq(&self, other: &MessageQueue) -> bool {
+        self.msgs
+            .iter()
+            .zip(other.msgs.iter())
+            .all(|(a, b)| a.event_id() == b.event_id())
     }
 }
 
 impl IntoIterator for MessageQueue {
-    type Item = MessageWrapper;
+    type Item = AnyPossiblyRedactedSyncMessageEvent;
     type IntoIter = IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -109,23 +117,38 @@ impl IntoIterator for MessageQueue {
 }
 
 pub(crate) mod ser_deser {
+    use std::fmt;
+
     use super::*;
+
+    struct MessageQueueDeserializer;
+
+    impl<'de> de::Visitor<'de> for MessageQueueDeserializer {
+        type Value = MessageQueue;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an array of message events")
+        }
+
+        fn visit_seq<S>(self, mut access: S) -> Result<Self::Value, S::Error>
+        where
+            S: de::SeqAccess<'de>,
+        {
+            let mut msgs = Vec::with_capacity(access.size_hint().unwrap_or(0));
+
+            while let Some(msg) = access.next_element::<AnyPossiblyRedactedSyncMessageEvent>()? {
+                msgs.push(msg);
+            }
+
+            Ok(MessageQueue { msgs })
+        }
+    }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<MessageQueue, D::Error>
     where
         D: de::Deserializer<'de>,
     {
-        use serde::de::Error;
-
-        let messages: Vec<EventJson<MessageEvent>> = de::Deserialize::deserialize(deserializer)?;
-
-        let mut msgs = vec![];
-        for json in messages {
-            let msg = json.deserialize().map_err(D::Error::custom)?;
-            msgs.push(MessageWrapper(msg));
-        }
-
-        Ok(MessageQueue { msgs })
+        deserializer.deserialize_seq(MessageQueueDeserializer)
     }
 
     pub fn serialize<S>(msgs: &MessageQueue, serializer: S) -> Result<S::Ok, S::Error>
@@ -138,18 +161,17 @@ pub(crate) mod ser_deser {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use std::{collections::HashMap, convert::TryFrom};
 
-    use std::collections::HashMap;
-    use std::convert::TryFrom;
-
+    use matrix_sdk_common::{
+        events::{AnyPossiblyRedactedSyncMessageEvent, AnySyncMessageEvent},
+        identifiers::{RoomId, UserId},
+    };
+    use matrix_sdk_test::test_json;
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::*;
 
-    use matrix_sdk_test::test_json;
-
-    use crate::events::{collections::all::RoomEvent, EventJson};
-    use crate::identifiers::{RoomId, UserId};
+    use super::*;
     use crate::Room;
 
     #[test]
@@ -160,17 +182,13 @@ mod test {
         let mut room = Room::new(&id, &user);
 
         let json: &serde_json::Value = &test_json::MESSAGE_TEXT;
-        let event = serde_json::from_value::<EventJson<RoomEvent>>(json.clone()).unwrap();
+        let msg = AnyPossiblyRedactedSyncMessageEvent::Regular(
+            serde_json::from_value::<AnySyncMessageEvent>(json.clone()).unwrap(),
+        );
 
         let mut msgs = MessageQueue::new();
-        let message = if let RoomEvent::RoomMessage(msg) = event.deserialize().unwrap() {
-            msgs.push(msg.clone());
-            msg
-        } else {
-            panic!("this should always be a RoomMessage")
-        };
-        room.messages = msgs.clone();
-
+        msgs.push(msg.clone());
+        room.messages = msgs;
         let mut joined_rooms = HashMap::new();
         joined_rooms.insert(id, room);
 
@@ -178,7 +196,6 @@ mod test {
             serde_json::json!({
                 "!roomid:example.com": {
                     "room_id": "!roomid:example.com",
-                    "disambiguated_display_names": {},
                     "room_name": {
                         "name": null,
                         "canonical_alias": null,
@@ -191,7 +208,7 @@ mod test {
                     "creator": null,
                     "joined_members": {},
                     "invited_members": {},
-                    "messages": [ message ],
+                    "messages": [ msg ],
                     "typing_users": [],
                     "power_levels": null,
                     "encrypted": null,
@@ -212,24 +229,20 @@ mod test {
         let mut room = Room::new(&id, &user);
 
         let json: &serde_json::Value = &test_json::MESSAGE_TEXT;
-        let event = serde_json::from_value::<EventJson<RoomEvent>>(json.clone()).unwrap();
+        let msg = AnyPossiblyRedactedSyncMessageEvent::Regular(
+            serde_json::from_value::<AnySyncMessageEvent>(json.clone()).unwrap(),
+        );
 
         let mut msgs = MessageQueue::new();
-        let message = if let RoomEvent::RoomMessage(msg) = event.deserialize().unwrap() {
-            msgs.push(msg.clone());
-            msg
-        } else {
-            panic!("this should always be a RoomMessage")
-        };
+        msgs.push(msg.clone());
         room.messages = msgs;
 
         let mut joined_rooms = HashMap::new();
-        joined_rooms.insert(id, room.clone());
+        joined_rooms.insert(id, room);
 
         let json = serde_json::json!({
             "!roomid:example.com": {
                 "room_id": "!roomid:example.com",
-                "disambiguated_display_names": {},
                 "room_name": {
                     "name": null,
                     "canonical_alias": null,
@@ -242,7 +255,7 @@ mod test {
                 "creator": null,
                 "joined_members": {},
                 "invited_members": {},
-                "messages": [ message ],
+                "messages": [ msg ],
                 "typing_users": [],
                 "power_levels": null,
                 "encrypted": null,

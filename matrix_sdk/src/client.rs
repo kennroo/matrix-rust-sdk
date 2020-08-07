@@ -15,41 +15,45 @@
 
 #[cfg(feature = "encryption")]
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::convert::{TryFrom, TryInto};
-use std::fmt::{self, Debug};
-use std::path::Path;
-use std::result::Result as StdResult;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    convert::{TryFrom, TryInto},
+    fmt::{self, Debug},
+    path::Path,
+    result::Result as StdResult,
+    sync::Arc,
+};
 
-use matrix_sdk_common::instant::{Duration, Instant};
-use matrix_sdk_common::js_int::UInt;
-use matrix_sdk_common::locks::RwLock;
-use matrix_sdk_common::uuid::Uuid;
+use matrix_sdk_common::{
+    identifiers::ServerName,
+    instant::{Duration, Instant},
+    js_int::UInt,
+    locks::RwLock,
+    presence::PresenceState,
+    uuid::Uuid,
+};
 
 use futures_timer::Delay as sleep;
 use std::future::Future;
 #[cfg(feature = "encryption")]
 use tracing::{debug, warn};
-use tracing::{info, instrument, trace};
+use tracing::{error, info, instrument};
 
-use http::Method as HttpMethod;
-use http::Response as HttpResponse;
-use reqwest::header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderValue, InvalidHeaderValue};
 use url::Url;
 
-use crate::events::room::message::MessageEventContent;
-use crate::events::EventType;
-use crate::identifiers::{EventId, RoomId, RoomIdOrAliasId, UserId};
-use crate::Endpoint;
+use crate::{
+    events::{room::message::MessageEventContent, EventType},
+    identifiers::{EventId, RoomId, RoomIdOrAliasId, UserId},
+    Endpoint,
+};
 
 #[cfg(feature = "encryption")]
-use crate::identifiers::DeviceId;
+use crate::{identifiers::DeviceId, sas::Sas};
 
-use crate::api;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::VERSION;
-use crate::{Error, EventEmitter, Result};
+use crate::{api, http_client::HttpClient, EventEmitter, Result};
 use matrix_sdk_base::{BaseClient, BaseClientConfig, Room, Session, StateStore};
 
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -60,9 +64,9 @@ const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct Client {
     /// The URL of the homeserver to connect to.
-    homeserver: Url,
+    homeserver: Arc<Url>,
     /// The underlying HTTP client.
-    http_client: reqwest::Client,
+    http_client: HttpClient,
     /// User session data.
     pub(crate) base_client: BaseClient,
 }
@@ -105,6 +109,7 @@ pub struct ClientConfig {
     user_agent: Option<HeaderValue>,
     disable_ssl_verification: bool,
     base_config: BaseClientConfig,
+    timeout: Option<Duration>,
 }
 
 // #[cfg_attr(tarpaulin, skip)]
@@ -198,11 +203,18 @@ impl ClientConfig {
         self.base_config = self.base_config.passphrase(passphrase);
         self
     }
+
+    /// Set a timeout duration for all HTTP requests. The default is no timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 /// Settings for a sync call.
 pub struct SyncSettings {
+    pub(crate) filter: Option<sync_events::Filter>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) token: Option<String>,
     pub(crate) full_state: bool,
@@ -235,6 +247,17 @@ impl SyncSettings {
         self
     }
 
+    /// Set the sync filter.
+    /// It can be either the filter ID, or the definition for the filter.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` - The filter configuration that should be used for the sync call.
+    pub fn filter(mut self, filter: sync_events::Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
     /// Should the server return the full state from the start of the timeline.
     ///
     /// This does nothing if no sync token is set.
@@ -248,27 +271,27 @@ impl SyncSettings {
     }
 }
 
-use api::r0::account::register;
-use api::r0::directory::get_public_rooms;
-use api::r0::directory::get_public_rooms_filtered;
 #[cfg(feature = "encryption")]
 use api::r0::keys::{claim_keys, get_keys, upload_keys, KeyAlgorithm};
-use api::r0::membership::{
-    ban_user, forget_room,
-    invite_user::{self, InvitationRecipient},
-    join_room_by_id, join_room_by_id_or_alias, kick_user, leave_room, Invite3pid,
-};
-use api::r0::message::create_message_event;
-use api::r0::message::get_message_events;
-use api::r0::read_marker::set_read_marker;
-use api::r0::receipt::create_receipt;
-use api::r0::room::create_room;
-use api::r0::session::login;
-use api::r0::sync::sync_events;
 #[cfg(feature = "encryption")]
 use api::r0::to_device::send_event_to_device;
-use api::r0::typing::create_typing_event;
-use api::r0::uiaa::UiaaResponse;
+use api::r0::{
+    account::register,
+    directory::{get_public_rooms, get_public_rooms_filtered},
+    membership::{
+        ban_user, forget_room,
+        invite_user::{self, InvitationRecipient},
+        join_room_by_id, join_room_by_id_or_alias, kick_user, leave_room, Invite3pid,
+    },
+    message::{create_message_event, get_message_events},
+    read_marker::set_read_marker,
+    receipt::create_receipt,
+    room::create_room,
+    session::login,
+    sync::sync_events,
+    typing::create_typing_event,
+    uiaa::UiaaResponse,
+};
 
 impl Client {
     /// Creates a new client for making HTTP requests to the given homeserver.
@@ -292,16 +315,21 @@ impl Client {
         homeserver_url: U,
         config: ClientConfig,
     ) -> Result<Self> {
-        #[allow(clippy::match_wild_err_arm)]
-        let homeserver: Url = match homeserver_url.try_into() {
-            Ok(u) => u,
-            Err(_e) => panic!("Error parsing homeserver url"),
+        let homeserver = if let Ok(u) = homeserver_url.try_into() {
+            u
+        } else {
+            panic!("Error parsing homeserver url")
         };
 
         let http_client = reqwest::Client::builder();
 
         #[cfg(not(target_arch = "wasm32"))]
         let http_client = {
+            let http_client = match config.timeout {
+                Some(x) => http_client.timeout(x),
+                None => http_client,
+            };
+
             let http_client = if config.disable_ssl_verification {
                 http_client.danger_accept_invalid_certs(true)
             } else {
@@ -325,7 +353,12 @@ impl Client {
             http_client.default_headers(headers)
         };
 
-        let http_client = http_client.build()?;
+        let homeserver = Arc::new(homeserver);
+
+        let http_client = HttpClient {
+            homeserver: homeserver.clone(),
+            inner: http_client.build()?,
+        };
 
         let base_client = BaseClient::new_with_config(config.base_config)?;
 
@@ -344,6 +377,12 @@ impl Client {
     /// The Homeserver of the client.
     pub fn homeserver(&self) -> &Url {
         &self.homeserver
+    }
+
+    /// Get the user id of the current owner of the client.
+    pub async fn user_id(&self) -> Option<UserId> {
+        let session = self.base_client.session().read().await;
+        session.as_ref().cloned().map(|s| s.user_id)
     }
 
     /// Add `EventEmitter` to `Client`.
@@ -408,6 +447,15 @@ impl Client {
 
     /// Login to the server.
     ///
+    /// This can be used for the first login as well as for subsequent logins,
+    /// note that if the device id isn't provided a new device will be created.
+    ///
+    /// If this isn't the first login a device id should be provided to restore
+    /// the correct stores.
+    ///
+    /// Alternatively the `restore_login()` method can be used to restore a
+    /// logged in client without the password.
+    ///
     /// # Arguments
     ///
     /// * `user` - The user that should be logged in to the homeserver.
@@ -433,7 +481,7 @@ impl Client {
             login_info: login::LoginInfo::Password {
                 password: password.into(),
             },
-            device_id: device_id.map(|d| d.into()),
+            device_id: device_id.map(|d| d.into().into()),
             initial_device_display_name: initial_device_display_name.map(|d| d.into()),
         };
 
@@ -444,6 +492,12 @@ impl Client {
     }
 
     /// Restore a previously logged in session.
+    ///
+    /// This can be used to restore the client to a logged in state, loading all
+    /// the stored state and encryption keys.
+    ///
+    /// Alternatively, if the whole session isn't stored the `login()` method
+    /// can be used with a device id.
     ///
     /// # Arguments
     ///
@@ -517,7 +571,7 @@ impl Client {
     pub async fn join_room_by_id_or_alias(
         &self,
         alias: &RoomIdOrAliasId,
-        server_names: &[String],
+        server_names: &[Box<ServerName>],
     ) -> Result<join_room_by_id_or_alias::Response> {
         let request = join_room_by_id_or_alias::Request {
             room_id_or_alias: alias.clone(),
@@ -751,8 +805,8 @@ impl Client {
     /// # use url::Url;
     ///
     /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// let mut builder = RoomBuilder::default();
-    /// builder.creation_content(false)
+    /// let mut builder = RoomBuilder::new();
+    /// builder.federate(false)
     ///     .initial_state(vec![])
     ///     .visibility(Visibility::Public)
     ///     .name("name")
@@ -918,7 +972,7 @@ impl Client {
     /// # use matrix_sdk::{Client, SyncSettings};
     /// # use url::Url;
     /// # use futures::executor::block_on;
-    /// # use ruma_identifiers::RoomId;
+    /// # use matrix_sdk::identifiers::RoomId;
     /// # use std::convert::TryFrom;
     /// use matrix_sdk::events::room::message::{MessageEventContent, TextMessageEventContent};
     /// # block_on(async {
@@ -927,12 +981,7 @@ impl Client {
     /// # let room_id = RoomId::try_from("!test:localhost").unwrap();
     /// use matrix_sdk_common::uuid::Uuid;
     ///
-    /// let content = MessageEventContent::Text(TextMessageEventContent {
-    ///     body: "Hello world".to_owned(),
-    ///     format: None,
-    ///     formatted_body: None,
-    ///     relates_to: None,
-    /// });
+    /// let content = MessageEventContent::Text(TextMessageEventContent::plain("Hello world"));
     /// let txn_id = Uuid::new_v4();
     /// client.room_send(&room_id, content, Some(txn_id)).await.unwrap();
     /// # })
@@ -1006,78 +1055,6 @@ impl Client {
         Ok(response)
     }
 
-    async fn send_request(
-        &self,
-        requires_auth: bool,
-        method: HttpMethod,
-        request: http::Request<Vec<u8>>,
-    ) -> Result<reqwest::Response> {
-        let url = request.uri();
-        let path_and_query = url.path_and_query().unwrap();
-        let mut url = self.homeserver.clone();
-
-        url.set_path(path_and_query.path());
-        url.set_query(path_and_query.query());
-
-        let request_builder = match method {
-            HttpMethod::GET => self.http_client.get(url),
-            HttpMethod::POST => {
-                let body = request.body().clone();
-                self.http_client
-                    .post(url)
-                    .body(body)
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-            }
-            HttpMethod::PUT => {
-                let body = request.body().clone();
-                self.http_client
-                    .put(url)
-                    .body(body)
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-            }
-            HttpMethod::DELETE => {
-                let body = request.body().clone();
-                self.http_client
-                    .delete(url)
-                    .body(body)
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-            }
-            method => panic!("Unsupported method {}", method),
-        };
-
-        let request_builder = if requires_auth {
-            let session = self.base_client.session().read().await;
-
-            if let Some(session) = session.as_ref() {
-                let header_value = format!("Bearer {}", &session.access_token);
-                request_builder.header(AUTHORIZATION, header_value)
-            } else {
-                return Err(Error::AuthenticationRequired);
-            }
-        } else {
-            request_builder
-        };
-
-        Ok(request_builder.send().await?)
-    }
-
-    async fn response_to_http_response(
-        &self,
-        mut response: reqwest::Response,
-    ) -> Result<http::Response<Vec<u8>>> {
-        let status = response.status();
-        let mut http_builder = HttpResponse::builder().status(status);
-        let headers = http_builder.headers_mut().unwrap();
-
-        for (k, v) in response.headers_mut().drain() {
-            if let Some(key) = k {
-                headers.insert(key, v);
-            }
-        }
-        let body = response.bytes().await?.as_ref().to_owned();
-        Ok(http_builder.body(body).unwrap())
-    }
-
     /// Send an arbitrary request to the server, without updating client state.
     ///
     /// **Warning:** Because this method *does not* update the client state, it is
@@ -1120,20 +1097,9 @@ impl Client {
         &self,
         request: Request,
     ) -> Result<Request::Response> {
-        let request: http::Request<Vec<u8>> = request.try_into()?;
-        let response = self
-            .send_request(
-                Request::METADATA.requires_authentication,
-                Request::METADATA.method,
-                request,
-            )
-            .await?;
-
-        trace!("Got response: {:?}", response);
-
-        let response = self.response_to_http_response(response).await?;
-
-        Ok(<Request::Response>::try_from(response)?)
+        self.http_client
+            .send(request, self.base_client.session().clone())
+            .await
     }
 
     /// Send an arbitrary request to the server, without updating client state.
@@ -1173,22 +1139,9 @@ impl Client {
         &self,
         request: Request,
     ) -> Result<Request::Response> {
-        let request: http::Request<Vec<u8>> = request.try_into()?;
-        let response = self
-            .send_request(
-                Request::METADATA.requires_authentication,
-                Request::METADATA.method,
-                request,
-            )
-            .await?;
-
-        trace!("Got response: {:?}", response);
-
-        let response = self.response_to_http_response(response).await?;
-
-        let uiaa: Result<_> = <Request::Response>::try_from(response).map_err(Into::into);
-
-        Ok(uiaa?)
+        self.http_client
+            .send_uiaa(request, self.base_client.session().clone())
+            .await
     }
 
     /// Synchronize the client's state with the latest state on the server.
@@ -1202,10 +1155,10 @@ impl Client {
     #[instrument]
     pub async fn sync(&self, sync_settings: SyncSettings) -> Result<sync_events::Response> {
         let request = sync_events::Request {
-            filter: None,
+            filter: sync_settings.filter,
             since: sync_settings.token,
             full_state: sync_settings.full_state,
-            set_presence: sync_events::SetPresence::Online,
+            set_presence: PresenceState::Online,
             timeout: sync_settings.timeout,
         };
 
@@ -1282,6 +1235,7 @@ impl Client {
         C: Future<Output = ()>,
     {
         let mut sync_settings = sync_settings;
+        let filter = sync_settings.filter.clone();
         let mut last_sync_time: Option<Instant> = None;
 
         if sync_settings.token.is_none() {
@@ -1291,15 +1245,14 @@ impl Client {
         loop {
             let response = self.sync(sync_settings.clone()).await;
 
-            let response = if let Ok(r) = response {
-                r
-            } else {
-                sleep::new(Duration::from_secs(1)).await;
-
-                continue;
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Received an invalid response: {}", e);
+                    sleep::new(Duration::from_secs(1)).await;
+                    continue;
+                }
             };
-
-            // TODO send out to-device messages here
 
             #[cfg(feature = "encryption")]
             {
@@ -1316,6 +1269,16 @@ impl Client {
 
                     if let Err(e) = response {
                         warn!("Error while querying device keys {:?}", e);
+                    }
+                }
+
+                for request in self.base_client.outgoing_to_device_requests().await {
+                    let transaction_id = request.txn_id.clone();
+
+                    if self.send(request).await.is_ok() {
+                        self.base_client
+                            .mark_to_device_request_as_sent(&transaction_id)
+                            .await;
                     }
                 }
             }
@@ -1340,6 +1303,9 @@ impl Client {
                     .await
                     .expect("No sync token found after initial sync"),
             );
+            if let Some(f) = filter.as_ref() {
+                sync_settings = sync_settings.filter(f.clone());
+            }
         }
     }
 
@@ -1358,7 +1324,7 @@ impl Client {
     #[instrument]
     async fn claim_one_time_keys(
         &self,
-        one_time_keys: BTreeMap<UserId, BTreeMap<DeviceId, KeyAlgorithm>>,
+        one_time_keys: BTreeMap<UserId, BTreeMap<Box<DeviceId>, KeyAlgorithm>>,
     ) -> Result<claim_keys::Response> {
         let request = claim_keys::Request {
             timeout: None,
@@ -1462,7 +1428,7 @@ impl Client {
             users_for_query
         );
 
-        let mut device_keys: BTreeMap<UserId, Vec<DeviceId>> = BTreeMap::new();
+        let mut device_keys: BTreeMap<UserId, Vec<Box<DeviceId>>> = BTreeMap::new();
 
         for user in users_for_query.drain() {
             device_keys.insert(user, Vec::new());
@@ -1481,6 +1447,22 @@ impl Client {
 
         Ok(response)
     }
+
+    /// Get a `Sas` verification object with the given flow id.
+    #[cfg(feature = "encryption")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "encryption")))]
+    #[instrument]
+    pub async fn get_verification(&self, flow_id: &str) -> Option<Sas> {
+        self.base_client
+            .get_verification(flow_id)
+            .await
+            .map(|sas| Sas {
+                inner: sas,
+                session: self.base_client.session().clone(),
+                http_client: self.http_client.clone(),
+                homeserver: self.homeserver.clone(),
+            })
+    }
 }
 
 #[cfg(test)]
@@ -1491,23 +1473,27 @@ mod test {
         get_public_rooms_filtered::{self, Filter},
         invite_user, kick_user, leave_room,
         register::RegistrationKind,
-        set_read_marker, Invite3pid, MessageEventContent,
+        set_read_marker, Client, ClientConfig, Invite3pid, MessageEventContent, Session,
+        SyncSettings, Url,
     };
-    use super::{Client, ClientConfig, Session, SyncSettings, Url};
-    use crate::events::collections::all::RoomEvent;
     use crate::events::room::message::TextMessageEventContent;
-    use crate::identifiers::{EventId, RoomId, RoomIdOrAliasId, UserId};
-    use crate::{RegistrationBuilder, RoomListFilterBuilder};
+
+    use crate::{
+        identifiers::{EventId, RoomId, RoomIdOrAliasId, UserId},
+        RegistrationBuilder, RoomListFilterBuilder,
+    };
 
     use matrix_sdk_base::JsonStore;
     use matrix_sdk_test::{test_json, EventBuilder, EventsJson};
     use mockito::{mock, Matcher};
     use tempfile::tempdir;
 
-    use std::convert::TryFrom;
-    use std::path::Path;
-    use std::str::FromStr;
-    use std::time::Duration;
+    use std::{
+        convert::{TryFrom, TryInto},
+        path::Path,
+        str::FromStr,
+        time::Duration,
+    };
 
     #[tokio::test]
     async fn test_join_leave_room() {
@@ -1518,7 +1504,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -1583,7 +1569,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:example.com").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -1611,15 +1597,15 @@ mod test {
         let session = Session {
             access_token: "12345".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
         let homeserver = url::Url::parse(&mockito::server_url()).unwrap();
         let client = Client::new(homeserver).unwrap();
         client.restore_login(session).await.unwrap();
 
         let mut response = EventBuilder::default()
-            .add_room_event(EventsJson::Member, RoomEvent::RoomMember)
-            .add_room_event(EventsJson::PowerLevels, RoomEvent::RoomPowerLevels)
+            .add_state_event(EventsJson::Member)
+            .add_state_event(EventsJson::PowerLevels)
             .build_sync_response();
 
         client
@@ -1723,7 +1709,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -1752,7 +1738,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -1770,7 +1756,7 @@ mod test {
         assert_eq!(
             // this is the `join_by_room_id::Response` but since no PartialEq we check the RoomId field
             client
-                .join_room_by_id_or_alias(&room_id, &["server.com".to_string()])
+                .join_room_by_id_or_alias(&room_id, &["server.com".try_into().unwrap()])
                 .await
                 .unwrap()
                 .room_id,
@@ -1788,7 +1774,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: user.clone(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -1815,7 +1801,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: user.clone(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -1876,7 +1862,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: user.clone(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -1911,7 +1897,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -1947,7 +1933,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: user.clone(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -1982,7 +1968,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: user.clone(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2017,7 +2003,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: user.clone(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2048,12 +2034,12 @@ mod test {
         let homeserver = Url::from_str(&mockito::server_url()).unwrap();
         let user_id = UserId::try_from("@example:localhost").unwrap();
         let room_id = RoomId::try_from("!testroom:example.org").unwrap();
-        let event_id = EventId::new("example.org").unwrap();
+        let event_id = EventId::try_from("$xxxxxx:example.org").unwrap();
 
         let session = Session {
             access_token: "1234".to_owned(),
             user_id,
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2084,12 +2070,12 @@ mod test {
         let homeserver = Url::from_str(&mockito::server_url()).unwrap();
         let user_id = UserId::try_from("@example:localhost").unwrap();
         let room_id = RoomId::try_from("!testroom:example.org").unwrap();
-        let event_id = EventId::new("example.org").unwrap();
+        let event_id = EventId::try_from("$xxxxxx:example.org").unwrap();
 
         let session = Session {
             access_token: "1234".to_owned(),
             user_id,
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2124,7 +2110,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: user.clone(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2168,7 +2154,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: user.clone(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2184,9 +2170,8 @@ mod test {
 
         let content = MessageEventContent::Text(TextMessageEventContent {
             body: "Hello world".to_owned(),
-            format: None,
-            formatted_body: None,
             relates_to: None,
+            formatted: None,
         });
         let txn_id = Uuid::new_v4();
         let response = client
@@ -2207,7 +2192,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2244,7 +2229,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2276,7 +2261,7 @@ mod test {
         let session = Session {
             access_token: "12345".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let homeserver = url::Url::parse(&mockito::server_url()).unwrap();
@@ -2310,7 +2295,7 @@ mod test {
         let session = Session {
             access_token: "12345".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let homeserver = url::Url::parse(&mockito::server_url()).unwrap();
@@ -2344,7 +2329,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@cheeky_monkey:matrix.org").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2386,6 +2371,8 @@ mod test {
             base_client.sync_token().await,
             Some("s526_47314_0_7_1_1_1_11444_1".to_string())
         );
+
+        // This is commented out because this field is private...
         // assert_eq!(
         //     *base_client.ignored_users.read().await,
         //     vec![UserId::try_from("@someone:example.org").unwrap()]
@@ -2413,13 +2400,33 @@ mod test {
     }
 
     #[tokio::test]
+    async fn login_with_device() {
+        let homeserver = Url::from_str(&mockito::server_url()).unwrap();
+
+        let _m = mock("POST", "/_matrix/client/r0/login")
+            .with_status(200)
+            .with_body(test_json::LOGIN.to_string())
+            .create();
+
+        let client = Client::new(homeserver).unwrap();
+
+        client
+            .login("example", "wordpass", None, None)
+            .await
+            .unwrap();
+
+        let logged_in = client.logged_in().await;
+        assert!(logged_in, "Clint should be logged in");
+    }
+
+    #[tokio::test]
     async fn sync() {
         let homeserver = Url::from_str(&mockito::server_url()).unwrap();
 
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(
@@ -2449,7 +2456,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@example:localhost").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         let _m = mock(

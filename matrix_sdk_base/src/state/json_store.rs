@@ -1,16 +1,15 @@
-use std::collections::HashMap;
-use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    fmt, fs,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
-use matrix_sdk_common::identifiers::RoomId;
-use matrix_sdk_common::locks::RwLock;
-use tokio::fs as async_fs;
-use tokio::io::AsyncWriteExt;
+use matrix_sdk_common::{identifiers::RoomId, locks::RwLock};
+use tokio::{fs as async_fs, io::AsyncWriteExt};
 
 use super::{AllRooms, ClientState, StateStore};
 use crate::{Error, Result, Room, RoomState, Session};
@@ -39,6 +38,36 @@ impl JsonStore {
             user_path_set: AtomicBool::new(false),
         })
     }
+
+    /// Build a path for a file where the Room state to be stored in.
+    async fn build_room_path(&self, room_state: &str, room_id: &RoomId) -> PathBuf {
+        let mut path = self.path.read().await.clone();
+
+        path.push("rooms");
+        path.push(room_state);
+        path.push(JsonStore::sanitize_room_id(room_id));
+        path.set_extension("json");
+
+        path
+    }
+
+    /// Build a path for the file where the Client state to be stored in.
+    async fn build_client_path(&self) -> PathBuf {
+        let mut path = self.path.read().await.clone();
+        path.push("client");
+        path.set_extension("json");
+
+        path
+    }
+
+    /// Replace common characters that can't be used in a file name with an
+    /// underscore.
+    fn sanitize_room_id(room_id: &RoomId) -> String {
+        room_id.as_str().replace(
+            &['.', ':', '<', '>', '"', '/', '\\', '|', '?', '*'][..],
+            "_",
+        )
+    }
 }
 
 impl fmt::Debug for JsonStore {
@@ -57,8 +86,7 @@ impl StateStore for JsonStore {
             self.path.write().await.push(sess.user_id.localpart())
         }
 
-        let mut path = self.path.read().await.clone();
-        path.push("client.json");
+        let path = self.build_client_path().await;
 
         let json = async_fs::read_to_string(path)
             .await
@@ -93,7 +121,6 @@ impl StateStore for JsonStore {
                 }
 
                 let json = async_fs::read_to_string(&file).await?;
-
                 let room = serde_json::from_str::<Room>(&json).map_err(Error::from)?;
                 let room_id = room.room_id.clone();
 
@@ -115,8 +142,7 @@ impl StateStore for JsonStore {
     }
 
     async fn store_client_state(&self, state: ClientState) -> Result<()> {
-        let mut path = self.path.read().await.clone();
-        path.push("client.json");
+        let path = self.build_client_path().await;
 
         if !path.exists() {
             let mut dir = path.clone();
@@ -147,9 +173,7 @@ impl StateStore for JsonStore {
             self.path.write().await.push(room.own_user_id.localpart())
         }
 
-        let mut path = self.path.read().await.clone();
-        path.push("rooms");
-        path.push(&format!("{}/{}.json", room_state, room.room_id));
+        let path = self.build_room_path(room_state, &room.room_id).await;
 
         if !path.exists() {
             let mut dir = path.clone();
@@ -179,15 +203,13 @@ impl StateStore for JsonStore {
             return Err(Error::StateStore("path for JsonStore not set".into()));
         }
 
-        let mut to_del = self.path.read().await.clone();
-        to_del.push("rooms");
-        to_del.push(&format!("{}/{}.json", room_state, room_id));
+        let path = self.build_room_path(room_state, room_id).await;
 
-        if !to_del.exists() {
-            return Err(Error::StateStore(format!("file {:?} not found", to_del)));
+        if !path.exists() {
+            return Err(Error::StateStore(format!("file {:?} not found", path)));
         }
 
-        tokio::fs::remove_file(to_del).await.map_err(Error::from)
+        tokio::fs::remove_file(path).await.map_err(Error::from)
     }
 }
 
@@ -195,13 +217,15 @@ impl StateStore for JsonStore {
 mod test {
     use super::*;
 
-    use std::convert::TryFrom;
-    use std::path::PathBuf;
+    use std::{convert::TryFrom, path::PathBuf};
 
     use tempfile::tempdir;
 
-    use crate::identifiers::{RoomId, UserId};
-    use crate::{BaseClient, BaseClientConfig, Session};
+    use crate::{
+        identifiers::{RoomId, UserId},
+        push::Ruleset,
+        BaseClient, BaseClientConfig, Session,
+    };
 
     use matrix_sdk_test::{sync_response, SyncResponseFile};
 
@@ -215,13 +239,13 @@ mod test {
         let sess = Session {
             access_token: "32nj9zu034btz90".to_string(),
             user_id: user.clone(),
-            device_id: "Tester".to_string(),
+            device_id: "Tester".into(),
         };
 
         let state = ClientState {
             sync_token: Some("hello".into()),
             ignored_users: vec![user],
-            push_ruleset: None,
+            push_ruleset: None::<Ruleset>,
         };
 
         let mut path_with_user = PathBuf::from(path);
@@ -345,7 +369,7 @@ mod test {
         let session = Session {
             access_token: "1234".to_owned(),
             user_id: UserId::try_from("@cheeky_monkey:matrix.org").unwrap(),
-            device_id: "DEVICEID".to_owned(),
+            device_id: "DEVICEID".into(),
         };
 
         // a sync response to populate our JSON store

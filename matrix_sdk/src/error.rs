@@ -14,16 +14,17 @@
 
 //! Error conditions.
 
+use matrix_sdk_base::Error as MatrixError;
+use matrix_sdk_common::{
+    api::{r0::uiaa::UiaaResponse as UiaaError, Error as RumaClientError},
+    FromHttpResponseError as RumaResponseError, IntoHttpError as RumaIntoHttpError,
+};
 use reqwest::Error as ReqwestError;
 use serde_json::Error as JsonError;
 use thiserror::Error;
 
-use matrix_sdk_base::Error as MatrixError;
-
-use crate::api::r0::uiaa::UiaaResponse as UiaaError;
-use crate::api::Error as RumaClientError;
-use crate::FromHttpResponseError as RumaResponseError;
-use crate::IntoHttpError as RumaIntoHttpError;
+#[cfg(feature = "encryption")]
+use matrix_sdk_base::CryptoStoreError;
 
 /// Result type of the rust-sdk.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -54,6 +55,11 @@ pub enum Error {
     /// An error occurred in the Matrix client library.
     #[error(transparent)]
     MatrixError(#[from] MatrixError),
+
+    /// An error occurred in the crypto store.
+    #[cfg(feature = "encryption")]
+    #[error(transparent)]
+    CryptoStoreError(#[from] CryptoStoreError),
 
     /// An error occurred while authenticating.
     ///

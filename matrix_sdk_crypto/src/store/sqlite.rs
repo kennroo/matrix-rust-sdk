@@ -12,32 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use matrix_sdk_common::instant::{Duration, Instant};
-use std::collections::{BTreeMap, HashSet};
-use std::convert::TryFrom;
-use std::path::{Path, PathBuf};
-use std::result::Result as StdResult;
-use std::sync::Arc;
-use url::Url;
+use std::{
+    collections::{BTreeMap, HashSet},
+    convert::TryFrom,
+    path::{Path, PathBuf},
+    result::Result as StdResult,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use matrix_sdk_common::locks::Mutex;
+use matrix_sdk_common::{
+    api::r0::keys::{AlgorithmAndDeviceId, KeyAlgorithm},
+    events::Algorithm,
+    identifiers::{DeviceId, RoomId, UserId},
+    instant::{Duration, Instant},
+    locks::Mutex,
+};
 use olm_rs::PicklingMode;
 use sqlx::{query, query_as, sqlite::SqliteQueryAs, Connect, Executor, SqliteConnection};
+use url::Url;
 use zeroize::Zeroizing;
 
-use super::{Account, CryptoStore, CryptoStoreError, InboundGroupSession, Result, Session};
-use crate::device::{Device, TrustState};
-use crate::memory_stores::{DeviceStore, GroupSessionStore, SessionStore, UserDevices};
-use matrix_sdk_common::api::r0::keys::KeyAlgorithm;
-use matrix_sdk_common::events::Algorithm;
-use matrix_sdk_common::identifiers::{DeviceId, RoomId, UserId};
+use super::{CryptoStore, CryptoStoreError, Result};
+use crate::{
+    device::{Device, TrustState},
+    memory_stores::{DeviceStore, GroupSessionStore, SessionStore, UserDevices},
+    Account, IdentityKeys, InboundGroupSession, Session,
+};
 
 /// SQLite based implementation of a `CryptoStore`.
 pub struct SqliteStore {
-    user_id: Arc<String>,
-    device_id: Arc<String>,
-    account_id: Option<i64>,
+    user_id: Arc<UserId>,
+    device_id: Arc<Box<DeviceId>>,
+    account_info: Option<AccountInfo>,
     path: PathBuf,
 
     sessions: SessionStore,
@@ -48,6 +55,11 @@ pub struct SqliteStore {
 
     connection: Arc<Mutex<SqliteConnection>>,
     pickle_passphrase: Option<Zeroizing<String>>,
+}
+
+struct AccountInfo {
+    account_id: i64,
+    identity_keys: Arc<IdentityKeys>,
 }
 
 static DATABASE_NAME: &str = "matrix-sdk-crypto.db";
@@ -66,7 +78,7 @@ impl SqliteStore {
     /// * `path` - The path where the database file should reside in.
     pub async fn open<P: AsRef<Path>>(
         user_id: &UserId,
-        device_id: &str,
+        device_id: &DeviceId,
         path: P,
     ) -> Result<SqliteStore> {
         SqliteStore::open_helper(user_id, device_id, path, None).await
@@ -88,7 +100,7 @@ impl SqliteStore {
     /// the encryption keys.
     pub async fn open_with_passphrase<P: AsRef<Path>>(
         user_id: &UserId,
-        device_id: &str,
+        device_id: &DeviceId,
         path: P,
         passphrase: &str,
     ) -> Result<SqliteStore> {
@@ -109,7 +121,7 @@ impl SqliteStore {
 
     async fn open_helper<P: AsRef<Path>>(
         user_id: &UserId,
-        device_id: &str,
+        device_id: &DeviceId,
         path: P,
         passphrase: Option<Zeroizing<String>>,
     ) -> Result<SqliteStore> {
@@ -117,9 +129,9 @@ impl SqliteStore {
 
         let connection = SqliteConnection::connect(url.as_ref()).await?;
         let store = SqliteStore {
-            user_id: Arc::new(user_id.to_string()),
-            device_id: Arc::new(device_id.to_owned()),
-            account_id: None,
+            user_id: Arc::new(user_id.to_owned()),
+            device_id: Arc::new(device_id.into()),
+            account_info: None,
             sessions: SessionStore::new(),
             inbound_group_sessions: GroupSessionStore::new(),
             devices: DeviceStore::new(),
@@ -133,6 +145,10 @@ impl SqliteStore {
         Ok(store)
     }
 
+    fn account_id(&self) -> Option<i64> {
+        self.account_info.as_ref().map(|i| i.account_id)
+    }
+
     async fn create_tables(&self) -> Result<()> {
         let mut connection = self.connection.lock().await;
         connection
@@ -144,6 +160,7 @@ impl SqliteStore {
                 "device_id" TEXT NOT NULL,
                 "pickle" BLOB NOT NULL,
                 "shared" INTEGER NOT NULL,
+                "uploaded_key_count" INTEGER NOT NULL,
                 UNIQUE(user_id,device_id)
             );
         "#,
@@ -261,6 +278,25 @@ impl SqliteStore {
             )
             .await?;
 
+        connection
+            .execute(
+                r#"
+            CREATE TABLE IF NOT EXISTS device_signatures (
+                "id" INTEGER NOT NULL PRIMARY KEY,
+                "device_id" INTEGER NOT NULL,
+                "user_id" TEXT NOT NULL,
+                "key_algorithm" TEXT NOT NULL,
+                "signature" TEXT NOT NULL,
+                FOREIGN KEY ("device_id") REFERENCES "devices" ("id")
+                    ON DELETE CASCADE
+                UNIQUE(device_id, user_id, key_algorithm)
+            );
+
+            CREATE INDEX IF NOT EXISTS "device_keys_device_id" ON "device_keys" ("device_id");
+        "#,
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -287,14 +323,17 @@ impl SqliteStore {
     }
 
     async fn load_sessions_for(&mut self, sender_key: &str) -> Result<Vec<Session>> {
-        let account_id = self.account_id.ok_or(CryptoStoreError::AccountUnset)?;
+        let account_info = self
+            .account_info
+            .as_ref()
+            .ok_or(CryptoStoreError::AccountUnset)?;
         let mut connection = self.connection.lock().await;
 
         let rows: Vec<(String, String, String, String)> = query_as(
             "SELECT pickle, sender_key, creation_time, last_use_time
              FROM sessions WHERE account_id = ? and sender_key = ?",
         )
-        .bind(account_id)
+        .bind(account_info.account_id)
         .bind(sender_key)
         .fetch_all(&mut *connection)
         .await?;
@@ -314,6 +353,9 @@ impl SqliteStore {
                     .ok_or(CryptoStoreError::SessionTimestampError)?;
 
                 Ok(Session::from_pickle(
+                    self.user_id.clone(),
+                    self.device_id.clone(),
+                    account_info.identity_keys.clone(),
                     pickle.to_string(),
                     self.get_pickle_mode(),
                     sender_key.to_string(),
@@ -325,7 +367,7 @@ impl SqliteStore {
     }
 
     async fn load_inbound_group_sessions(&self) -> Result<Vec<InboundGroupSession>> {
-        let account_id = self.account_id.ok_or(CryptoStoreError::AccountUnset)?;
+        let account_id = self.account_id().ok_or(CryptoStoreError::AccountUnset)?;
         let mut connection = self.connection.lock().await;
 
         let rows: Vec<(String, String, String, String)> = query_as(
@@ -356,7 +398,7 @@ impl SqliteStore {
     }
 
     async fn save_tracked_user(&self, user: &UserId, dirty: bool) -> Result<()> {
-        let account_id = self.account_id.ok_or(CryptoStoreError::AccountUnset)?;
+        let account_id = self.account_id().ok_or(CryptoStoreError::AccountUnset)?;
         let mut connection = self.connection.lock().await;
 
         query(
@@ -377,7 +419,7 @@ impl SqliteStore {
     }
 
     async fn load_tracked_users(&self) -> Result<(HashSet<UserId>, HashSet<UserId>)> {
-        let account_id = self.account_id.ok_or(CryptoStoreError::AccountUnset)?;
+        let account_id = self.account_id().ok_or(CryptoStoreError::AccountUnset)?;
         let mut connection = self.connection.lock().await;
 
         let rows: Vec<(String, bool)> = query_as(
@@ -409,7 +451,7 @@ impl SqliteStore {
     }
 
     async fn load_devices(&self) -> Result<DeviceStore> {
-        let account_id = self.account_id.ok_or(CryptoStoreError::AccountUnset)?;
+        let account_id = self.account_id().ok_or(CryptoStoreError::AccountUnset)?;
         let mut connection = self.connection.lock().await;
 
         let rows: Vec<(i64, String, String, Option<String>, i64)> = query_as(
@@ -455,28 +497,64 @@ impl SqliteStore {
                     .fetch_all(&mut *connection)
                     .await?;
 
-            let mut keys = BTreeMap::new();
+            let keys: BTreeMap<AlgorithmAndDeviceId, String> = key_rows
+                .into_iter()
+                .filter_map(|row| {
+                    let algorithm = KeyAlgorithm::try_from(&*row.0).ok()?;
+                    let key = row.1;
 
-            for row in key_rows {
-                let algorithm: &str = &row.0;
-                let algorithm = if let Ok(a) = KeyAlgorithm::try_from(algorithm) {
-                    a
+                    Some((
+                        AlgorithmAndDeviceId(algorithm, device_id.as_str().into()),
+                        key,
+                    ))
+                })
+                .collect();
+
+            let signature_rows: Vec<(String, String, String)> = query_as(
+                "SELECT user_id, key_algorithm, signature
+                         FROM device_signatures WHERE device_id = ?",
+            )
+            .bind(device_row_id)
+            .fetch_all(&mut *connection)
+            .await?;
+
+            let mut signatures: BTreeMap<UserId, BTreeMap<AlgorithmAndDeviceId, String>> =
+                BTreeMap::new();
+
+            for row in signature_rows {
+                let user_id = if let Ok(u) = UserId::try_from(&*row.0) {
+                    u
                 } else {
                     continue;
                 };
 
-                let key = &row.1;
+                let key_algorithm = if let Ok(k) = KeyAlgorithm::try_from(&*row.1) {
+                    k
+                } else {
+                    continue;
+                };
 
-                keys.insert(algorithm, key.to_owned());
+                let signature = row.2;
+
+                if !signatures.contains_key(&user_id) {
+                    let _ = signatures.insert(user_id.clone(), BTreeMap::new());
+                }
+                let user_map = signatures.get_mut(&user_id).unwrap();
+
+                user_map.insert(
+                    AlgorithmAndDeviceId(key_algorithm, device_id.as_str().into()),
+                    signature.to_owned(),
+                );
             }
 
             let device = Device::new(
                 user_id,
-                device_id.to_owned(),
+                device_id.as_str().into(),
                 display_name.clone(),
                 trust_state,
                 algorithms,
                 keys,
+                signatures,
             );
 
             store.add(device);
@@ -486,7 +564,7 @@ impl SqliteStore {
     }
 
     async fn save_device_helper(&self, device: Device) -> Result<()> {
-        let account_id = self.account_id.ok_or(CryptoStoreError::AccountUnset)?;
+        let account_id = self.account_id().ok_or(CryptoStoreError::AccountUnset)?;
 
         let mut connection = self.connection.lock().await;
 
@@ -501,8 +579,8 @@ impl SqliteStore {
              ",
         )
         .bind(account_id)
-        .bind(&device.user_id().to_string())
-        .bind(device.device_id())
+        .bind(device.user_id().as_str())
+        .bind(device.device_id().as_str())
         .bind(device.display_name())
         .bind(device.trust_state() as i64)
         .execute(&mut *connection)
@@ -512,8 +590,8 @@ impl SqliteStore {
             "SELECT id FROM devices
                       WHERE user_id = ? and device_id = ?",
         )
-        .bind(&device.user_id().to_string())
-        .bind(device.device_id())
+        .bind(device.user_id().as_str())
+        .bind(device.device_id().as_str())
         .fetch_one(&mut *connection)
         .await?;
 
@@ -540,10 +618,27 @@ impl SqliteStore {
                  ",
             )
             .bind(device_row_id)
-            .bind(key_algorithm.to_string())
+            .bind(key_algorithm.0.to_string())
             .bind(key)
             .execute(&mut *connection)
             .await?;
+        }
+
+        for (user_id, signature_map) in device.signatures() {
+            for (key_id, signature) in signature_map {
+                query(
+                    "INSERT OR IGNORE INTO device_signatures (
+                        device_id, user_id, key_algorithm, signature
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ",
+                )
+                .bind(device_row_id)
+                .bind(user_id.as_str())
+                .bind(key_id.0.to_string())
+                .bind(signature)
+                .execute(&mut *connection)
+                .await?;
+            }
         }
 
         Ok(())
@@ -564,22 +659,31 @@ impl CryptoStore for SqliteStore {
     async fn load_account(&mut self) -> Result<Option<Account>> {
         let mut connection = self.connection.lock().await;
 
-        let row: Option<(i64, String, bool)> = query_as(
-            "SELECT id, pickle, shared FROM accounts
+        let row: Option<(i64, String, bool, i64)> = query_as(
+            "SELECT id, pickle, shared, uploaded_key_count FROM accounts
                       WHERE user_id = ? and device_id = ?",
         )
-        .bind(&*self.user_id)
-        .bind(&*self.device_id)
+        .bind(self.user_id.as_str())
+        .bind(self.device_id.as_str())
         .fetch_optional(&mut *connection)
         .await?;
 
-        let result = if let Some((id, pickle, shared)) = row {
-            self.account_id = Some(id);
-            Some(Account::from_pickle(
+        let result = if let Some((id, pickle, shared, uploaded_key_count)) = row {
+            let account = Account::from_pickle(
                 pickle,
                 self.get_pickle_mode(),
                 shared,
-            )?)
+                uploaded_key_count,
+                &self.user_id,
+                &self.device_id,
+            )?;
+
+            self.account_info = Some(AccountInfo {
+                account_id: id,
+                identity_keys: account.identity_keys.clone(),
+            });
+
+            Some(account)
         } else {
             return Ok(None);
         };
@@ -611,8 +715,8 @@ impl CryptoStore for SqliteStore {
 
         query(
             "INSERT INTO accounts (
-                user_id, device_id, pickle, shared
-             ) VALUES (?1, ?2, ?3, ?4)
+                user_id, device_id, pickle, shared, uploaded_key_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(user_id, device_id) DO UPDATE SET
                 pickle = excluded.pickle,
                 shared = excluded.shared
@@ -622,6 +726,7 @@ impl CryptoStore for SqliteStore {
         .bind(&*self.device_id.to_string())
         .bind(&pickle)
         .bind(account.shared())
+        .bind(account.uploaded_key_count())
         .execute(&mut *connection)
         .await?;
 
@@ -632,18 +737,21 @@ impl CryptoStore for SqliteStore {
                 .fetch_one(&mut *connection)
                 .await?;
 
-        self.account_id = Some(account_id.0);
+        self.account_info = Some(AccountInfo {
+            account_id: account_id.0,
+            identity_keys: account.identity_keys.clone(),
+        });
 
         Ok(())
     }
 
     async fn save_sessions(&mut self, sessions: &[Session]) -> Result<()> {
+        let account_id = self.account_id().ok_or(CryptoStoreError::AccountUnset)?;
+
         // TODO turn this into a transaction
         for session in sessions {
             self.lazy_load_sessions(&session.sender_key).await?;
             self.sessions.add(session.clone()).await;
-
-            let account_id = self.account_id.ok_or(CryptoStoreError::AccountUnset)?;
 
             let session_id = session.session_id();
             let creation_time = serde_json::to_string(&session.creation_time.elapsed())?;
@@ -675,7 +783,7 @@ impl CryptoStore for SqliteStore {
     }
 
     async fn save_inbound_group_session(&mut self, session: InboundGroupSession) -> Result<bool> {
-        let account_id = self.account_id.ok_or(CryptoStoreError::AccountUnset)?;
+        let account_id = self.account_id().ok_or(CryptoStoreError::AccountUnset)?;
         let pickle = session.pickle(self.get_pickle_mode()).await;
         let mut connection = self.connection.lock().await;
         let session_id = session.session_id();
@@ -745,7 +853,7 @@ impl CryptoStore for SqliteStore {
     }
 
     async fn delete_device(&self, device: Device) -> Result<()> {
-        let account_id = self.account_id.ok_or(CryptoStoreError::AccountUnset)?;
+        let account_id = self.account_id().ok_or(CryptoStoreError::AccountUnset)?;
         let mut connection = self.connection.lock().await;
 
         query(
@@ -755,7 +863,7 @@ impl CryptoStore for SqliteStore {
         )
         .bind(account_id)
         .bind(&device.user_id().to_string())
-        .bind(&device.device_id())
+        .bind(device.device_id().as_str())
         .execute(&mut *connection)
         .await?;
 
@@ -785,32 +893,38 @@ impl std::fmt::Debug for SqliteStore {
 
 #[cfg(test)]
 mod test {
-    use crate::device::test::get_device;
-    use crate::olm::GroupSessionKey;
-    use matrix_sdk_common::api::r0::keys::SignedKey;
+    use crate::{device::test::get_device, olm::GroupSessionKey};
+    use matrix_sdk_common::{
+        api::r0::keys::SignedKey,
+        identifiers::{DeviceId, UserId},
+    };
     use olm_rs::outbound_group_session::OlmOutboundGroupSession;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 
-    use super::{
-        Account, CryptoStore, InboundGroupSession, RoomId, Session, SqliteStore, TryFrom, UserId,
-    };
+    use super::{Account, CryptoStore, InboundGroupSession, RoomId, Session, SqliteStore, TryFrom};
 
-    static USER_ID: &str = "@example:localhost";
-    static DEVICE_ID: &str = "DEVICEID";
+    fn example_user_id() -> UserId {
+        UserId::try_from("@example:localhost").unwrap()
+    }
+
+    fn example_device_id() -> &'static DeviceId {
+        "DEVICEID".into()
+    }
 
     async fn get_store(passphrase: Option<&str>) -> (SqliteStore, tempfile::TempDir) {
         let tmpdir = tempdir().unwrap();
         let tmpdir_path = tmpdir.path().to_str().unwrap();
 
-        let user_id = &UserId::try_from(USER_ID).unwrap();
+        let user_id = &example_user_id();
+        let device_id = example_device_id();
 
         let store = if let Some(passphrase) = passphrase {
-            SqliteStore::open_with_passphrase(&user_id, DEVICE_ID, tmpdir_path, passphrase)
+            SqliteStore::open_with_passphrase(&user_id, device_id, tmpdir_path, passphrase)
                 .await
                 .expect("Can't create a passphrase protected store")
         } else {
-            SqliteStore::open(&user_id, DEVICE_ID, tmpdir_path)
+            SqliteStore::open(&user_id, device_id, tmpdir_path)
                 .await
                 .expect("Can't create store")
         };
@@ -829,22 +943,37 @@ mod test {
         (account, store, dir)
     }
 
+    fn alice_id() -> UserId {
+        UserId::try_from("@alice:example.org").unwrap()
+    }
+
+    fn alice_device_id() -> Box<DeviceId> {
+        "ALICEDEVICE".into()
+    }
+
+    fn bob_id() -> UserId {
+        UserId::try_from("@bob:example.org").unwrap()
+    }
+
+    fn bob_device_id() -> Box<DeviceId> {
+        "BOBDEVICE".into()
+    }
+
     fn get_account() -> Account {
-        Account::new()
+        Account::new(&alice_id(), &alice_device_id())
     }
 
     async fn get_account_and_session() -> (Account, Session) {
-        let alice = Account::new();
+        let alice = Account::new(&alice_id(), &alice_device_id());
+        let bob = Account::new(&bob_id(), &bob_device_id());
 
-        let bob = Account::new();
-
-        bob.generate_one_time_keys(1).await;
+        bob.generate_one_time_keys_helper(1).await;
         let one_time_key = bob
             .one_time_keys()
             .await
             .curve25519()
             .iter()
-            .nth(0)
+            .next()
             .unwrap()
             .1
             .to_owned();
@@ -854,7 +983,7 @@ mod test {
         };
         let sender_key = bob.identity_keys().curve25519().to_owned();
         let session = alice
-            .create_outbound_session(&sender_key, &one_time_key)
+            .create_outbound_session_helper(&sender_key, &one_time_key)
             .await
             .unwrap();
 
@@ -865,7 +994,7 @@ mod test {
     async fn create_store() {
         let tmpdir = tempdir().unwrap();
         let tmpdir_path = tmpdir.path().to_str().unwrap();
-        let _ = SqliteStore::open(&UserId::try_from(USER_ID).unwrap(), "DEVICEID", tmpdir_path)
+        let _ = SqliteStore::open(&example_user_id(), "DEVICEID".into(), tmpdir_path)
             .await
             .expect("Can't create store");
     }
@@ -992,10 +1121,9 @@ mod test {
 
         drop(store);
 
-        let mut store =
-            SqliteStore::open(&UserId::try_from(USER_ID).unwrap(), DEVICE_ID, dir.path())
-                .await
-                .expect("Can't create store");
+        let mut store = SqliteStore::open(&example_user_id(), example_device_id(), dir.path())
+            .await
+            .expect("Can't create store");
 
         let loaded_account = store.load_account().await.unwrap().unwrap();
         assert_eq!(account, loaded_account);
@@ -1085,10 +1213,9 @@ mod test {
         assert!(store.users_for_key_query().contains(device.user_id()));
         drop(store);
 
-        let mut store =
-            SqliteStore::open(&UserId::try_from(USER_ID).unwrap(), DEVICE_ID, dir.path())
-                .await
-                .expect("Can't create store");
+        let mut store = SqliteStore::open(&example_user_id(), example_device_id(), dir.path())
+            .await
+            .expect("Can't create store");
 
         store.load_account().await.unwrap();
 
@@ -1102,10 +1229,9 @@ mod test {
             .unwrap();
         assert!(!store.users_for_key_query().contains(device.user_id()));
 
-        let mut store =
-            SqliteStore::open(&UserId::try_from(USER_ID).unwrap(), DEVICE_ID, dir.path())
-                .await
-                .expect("Can't create store");
+        let mut store = SqliteStore::open(&example_user_id(), example_device_id(), dir.path())
+            .await
+            .expect("Can't create store");
 
         store.load_account().await.unwrap();
 
@@ -1121,10 +1247,9 @@ mod test {
 
         drop(store);
 
-        let mut store =
-            SqliteStore::open(&UserId::try_from(USER_ID).unwrap(), DEVICE_ID, dir.path())
-                .await
-                .expect("Can't create store");
+        let mut store = SqliteStore::open(&example_user_id(), example_device_id(), dir.path())
+            .await
+            .expect("Can't create store");
 
         store.load_account().await.unwrap();
 
@@ -1143,8 +1268,8 @@ mod test {
         assert_eq!(device.keys(), loaded_device.keys());
 
         let user_devices = store.get_user_devices(device.user_id()).await.unwrap();
-        assert_eq!(user_devices.keys().nth(0).unwrap(), device.device_id());
-        assert_eq!(user_devices.devices().nth(0).unwrap(), &device);
+        assert_eq!(user_devices.keys().next().unwrap(), device.device_id());
+        assert_eq!(user_devices.devices().next().unwrap(), &device);
     }
 
     #[tokio::test]
@@ -1155,10 +1280,9 @@ mod test {
         store.save_devices(&[device.clone()]).await.unwrap();
         store.delete_device(device.clone()).await.unwrap();
 
-        let mut store =
-            SqliteStore::open(&UserId::try_from(USER_ID).unwrap(), DEVICE_ID, dir.path())
-                .await
-                .expect("Can't create store");
+        let mut store = SqliteStore::open(&example_user_id(), example_device_id(), dir.path())
+            .await
+            .expect("Can't create store");
 
         store.load_account().await.unwrap();
 

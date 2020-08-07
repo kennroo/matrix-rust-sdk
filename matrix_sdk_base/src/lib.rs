@@ -35,7 +35,10 @@
     unused_qualifications
 )]
 
-pub use crate::{error::Error, error::Result, session::Session};
+pub use crate::{
+    error::{Error, Result},
+    session::Session,
+};
 pub use matrix_sdk_common::*;
 
 mod client;
@@ -46,10 +49,17 @@ mod session;
 mod state;
 
 pub use client::{BaseClient, BaseClientConfig, RoomState, RoomStateType};
-pub use event_emitter::{CustomOrRawEvent, EventEmitter, SyncRoom};
-#[cfg(feature = "encryption")]
-pub use matrix_sdk_crypto::{Device, TrustState};
+pub use event_emitter::{CustomEvent, EventEmitter, SyncRoom};
 pub use models::Room;
+pub use state::{AllRooms, ClientState};
+
+#[cfg(feature = "encryption")]
+pub use matrix_sdk_crypto::{CryptoStoreError, Device, Sas, TrustState};
+
+#[cfg(feature = "messages")]
+#[cfg_attr(docsrs, doc(cfg(feature = "messages")))]
+pub use models::{MessageQueue, PossiblyRedactedExt};
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use state::JsonStore;
 pub use state::StateStore;

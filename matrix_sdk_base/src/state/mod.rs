@@ -15,6 +15,10 @@
 
 use std::collections::HashMap;
 
+use matrix_sdk_common::{
+    identifiers::{RoomId, UserId},
+    push::Ruleset,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,10 +26,10 @@ mod json_store;
 #[cfg(not(target_arch = "wasm32"))]
 pub use json_store::JsonStore;
 
-use crate::client::{BaseClient, Token};
-use crate::events::push_rules::Ruleset;
-use crate::identifiers::{RoomId, UserId};
-use crate::{Result, Room, RoomState, Session};
+use crate::{
+    client::{BaseClient, Token},
+    Result, Room, RoomState, Session,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use matrix_sdk_common_macros::send_sync;
@@ -117,8 +121,7 @@ pub trait StateStore {
 mod test {
     use super::*;
 
-    use std::collections::HashMap;
-    use std::convert::TryFrom;
+    use std::{collections::HashMap, convert::TryFrom};
 
     use crate::identifiers::RoomId;
 
@@ -159,7 +162,6 @@ mod test {
                     "creator": null,
                     "joined_members": {},
                     "invited_members": {},
-                    "disambiguated_display_names": {},
                     "typing_users": [],
                     "power_levels": null,
                     "encrypted": null,
@@ -176,7 +178,6 @@ mod test {
             serde_json::json!({
                 "!roomid:example.com": {
                     "room_id": "!roomid:example.com",
-                    "disambiguated_display_names": {},
                     "room_name": {
                         "name": null,
                         "canonical_alias": null,

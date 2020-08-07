@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use dashmap::{DashMap, ReadOnlyView};
-use matrix_sdk_common::locks::Mutex;
+use matrix_sdk_common::{
+    identifiers::{DeviceId, RoomId, UserId},
+    locks::Mutex,
+};
 
-use super::device::Device;
-use super::olm::{InboundGroupSession, Session};
-use matrix_sdk_common::identifiers::{DeviceId, RoomId, UserId};
+use super::{
+    device::Device,
+    olm::{InboundGroupSession, Session},
+};
 
 /// In-memory store for Olm Sessions.
 #[derive(Debug, Default)]
@@ -129,24 +132,24 @@ impl GroupSessionStore {
 /// In-memory store holding the devices of users.
 #[derive(Clone, Debug, Default)]
 pub struct DeviceStore {
-    entries: Arc<DashMap<UserId, DashMap<String, Device>>>,
+    entries: Arc<DashMap<UserId, DashMap<Box<DeviceId>, Device>>>,
 }
 
 /// A read only view over all devices belonging to a user.
 #[derive(Debug)]
 pub struct UserDevices {
-    entries: ReadOnlyView<DeviceId, Device>,
+    entries: ReadOnlyView<Box<DeviceId>, Device>,
 }
 
 impl UserDevices {
     /// Get the specific device with the given device id.
-    pub fn get(&self, device_id: &str) -> Option<Device> {
+    pub fn get(&self, device_id: &DeviceId) -> Option<Device> {
         self.entries.get(device_id).cloned()
     }
 
     /// Iterator over all the device ids of the user devices.
     pub fn keys(&self) -> impl Iterator<Item = &DeviceId> {
-        self.entries.keys()
+        self.entries.keys().map(|id| id.as_ref())
     }
 
     /// Iterator over all the devices of the user devices.
@@ -175,12 +178,12 @@ impl DeviceStore {
         let device_map = self.entries.get_mut(&user_id).unwrap();
 
         device_map
-            .insert(device.device_id().to_owned(), device)
+            .insert(device.device_id().into(), device)
             .is_none()
     }
 
     /// Get the device with the given device_id and belonging to the given user.
-    pub fn get(&self, user_id: &UserId, device_id: &str) -> Option<Device> {
+    pub fn get(&self, user_id: &UserId, device_id: &DeviceId) -> Option<Device> {
         self.entries
             .get(user_id)
             .and_then(|m| m.get(device_id).map(|d| d.value().clone()))
@@ -189,7 +192,7 @@ impl DeviceStore {
     /// Remove the device with the given device_id and belonging to the given user.
     ///
     /// Returns the device if it was removed, None if it wasn't in the store.
-    pub fn remove(&self, user_id: &UserId, device_id: &str) -> Option<Device> {
+    pub fn remove(&self, user_id: &UserId, device_id: &DeviceId) -> Option<Device> {
         self.entries
             .get(user_id)
             .and_then(|m| m.remove(device_id))
@@ -211,10 +214,11 @@ impl DeviceStore {
 mod test {
     use std::convert::TryFrom;
 
-    use crate::device::test::get_device;
-    use crate::memory_stores::{DeviceStore, GroupSessionStore, SessionStore};
-    use crate::olm::test::get_account_and_session;
-    use crate::olm::{InboundGroupSession, OutboundGroupSession};
+    use crate::{
+        device::test::get_device,
+        memory_stores::{DeviceStore, GroupSessionStore, SessionStore},
+        olm::{test::get_account_and_session, InboundGroupSession},
+    };
     use matrix_sdk_common::identifiers::RoomId;
 
     #[tokio::test]
@@ -251,9 +255,10 @@ mod test {
 
     #[tokio::test]
     async fn test_group_session_store() {
+        let (account, _) = get_account_and_session().await;
         let room_id = RoomId::try_from("!test:localhost").unwrap();
 
-        let outbound = OutboundGroupSession::new(&room_id);
+        let (outbound, _) = account.create_group_session_pair(&room_id).await;
 
         assert_eq!(0, outbound.message_index().await);
         assert!(!outbound.shared());
@@ -291,8 +296,8 @@ mod test {
 
         let user_devices = store.user_devices(device.user_id());
 
-        assert_eq!(user_devices.keys().nth(0).unwrap(), device.device_id());
-        assert_eq!(user_devices.devices().nth(0).unwrap(), &device);
+        assert_eq!(user_devices.keys().next().unwrap(), device.device_id());
+        assert_eq!(user_devices.devices().next().unwrap(), &device);
 
         let loaded_device = user_devices.get(device.device_id()).unwrap();
 

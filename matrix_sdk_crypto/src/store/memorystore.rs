@@ -12,17 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
-use matrix_sdk_common::locks::Mutex;
+use matrix_sdk_common::{
+    identifiers::{DeviceId, RoomId, UserId},
+    locks::Mutex,
+};
 
 use super::{Account, CryptoStore, InboundGroupSession, Result, Session};
-use crate::device::Device;
-use crate::memory_stores::{DeviceStore, GroupSessionStore, SessionStore, UserDevices};
-use matrix_sdk_common::identifiers::{DeviceId, RoomId, UserId};
-
+use crate::{
+    device::Device,
+    memory_stores::{DeviceStore, GroupSessionStore, SessionStore, UserDevices},
+};
 #[derive(Debug)]
 pub struct MemoryStore {
     sessions: SessionStore,
@@ -126,11 +128,11 @@ impl CryptoStore for MemoryStore {
 mod test {
     use std::convert::TryFrom;
 
-    use crate::device::test::get_device;
-    use crate::olm::test::get_account_and_session;
-    use crate::olm::{InboundGroupSession, OutboundGroupSession};
-    use crate::store::memorystore::MemoryStore;
-    use crate::store::CryptoStore;
+    use crate::{
+        device::test::get_device,
+        olm::{test::get_account_and_session, InboundGroupSession},
+        store::{memorystore::MemoryStore, CryptoStore},
+    };
     use matrix_sdk_common::identifiers::RoomId;
 
     #[tokio::test]
@@ -157,9 +159,10 @@ mod test {
 
     #[tokio::test]
     async fn test_group_session_store() {
+        let (account, _) = get_account_and_session().await;
         let room_id = RoomId::try_from("!test:localhost").unwrap();
 
-        let outbound = OutboundGroupSession::new(&room_id);
+        let (outbound, _) = account.create_group_session_pair(&room_id).await;
         let inbound = InboundGroupSession::new(
             "test_key",
             "test_key",
@@ -199,8 +202,8 @@ mod test {
 
         let user_devices = store.get_user_devices(device.user_id()).await.unwrap();
 
-        assert_eq!(user_devices.keys().nth(0).unwrap(), device.device_id());
-        assert_eq!(user_devices.devices().nth(0).unwrap(), &device);
+        assert_eq!(user_devices.keys().next().unwrap(), device.device_id());
+        assert_eq!(user_devices.devices().next().unwrap(), &device);
 
         let loaded_device = user_devices.get(device.device_id()).unwrap();
 
